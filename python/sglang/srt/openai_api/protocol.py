@@ -165,6 +165,7 @@ class CompletionRequest(BaseModel):
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    min_p: Optional[float] = 0.0
 
 
 class CompletionResponseChoice(BaseModel):
@@ -265,6 +266,7 @@ class ChatCompletionRequest(BaseModel):
     min_tokens: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    min_p: Optional[float] = 0.0
 
 
 class ChatMessage(BaseModel):
