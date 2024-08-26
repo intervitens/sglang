@@ -123,7 +123,7 @@ def create_streaming_error_response(
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     global chat_template_name
 
-    print(f"Use chat template: {chat_template_arg}")
+    logger.info(f"Use chat template: {chat_template_arg}")
     if not chat_template_exists(chat_template_arg):
         if not os.path.exists(chat_template_arg):
             raise RuntimeError(
@@ -355,7 +355,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
         }
 
     except Exception as e:
-        print("error in SGLang:", e)
+        logger.error("error in SGLang:", e)
         # Update batch status to "failed"
         retrieve_batch = batch_storage[batch_id]
         retrieve_batch.status = "failed"
@@ -435,6 +435,7 @@ def v1_generate_request(all_requests: List[CompletionRequest]):
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
+                "json_schema": request.json_schema,
                 "n": request.n,
                 "ignore_eos": request.ignore_eos,
             }
@@ -804,6 +805,7 @@ def v1_chat_generate_request(
                 "frequency_penalty": request.frequency_penalty,
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
+                "json_schema": request.json_schema,
                 "n": request.n,
             }
         )
