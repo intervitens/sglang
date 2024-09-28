@@ -29,6 +29,7 @@ from sglang.srt.constrained.jump_forward import JumpForwardMap
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 if TYPE_CHECKING:
@@ -130,6 +131,7 @@ class Req:
         self.image_sizes = None
         self.image_offsets = None
         self.pad_value = None
+        self.modalities = None
 
         # Prefix info
         self.extend_input_len = 0
@@ -178,19 +180,22 @@ class Req:
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = len(self.fill_ids)
-        max_prefix_len = input_len
+
+        # FIXME: To work around some bugs in logprob computation, we need to ensure each
+        # request has at least one token. Later, we can relax this requirement and use `input_len`.
+        max_prefix_len = input_len - 1
 
         if self.sampling_params.max_new_tokens > 0:
             # Need at least one token to compute logits
             max_prefix_len = min(max_prefix_len, input_len - 1)
 
         if self.return_logprob:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
-
             if self.normalized_prompt_logprob is None:
                 # Need at least two tokens to compute normalized logprob
                 max_prefix_len = min(max_prefix_len, input_len - 2)
+            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
+        max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -330,6 +335,8 @@ class ScheduleBatch:
     token_to_kv_pool: BaseTokenToKVPool
     tree_cache: BasePrefixCache
 
+    forward_mode: ForwardMode = None
+
     # Batched arguments to model runner
     input_ids: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
@@ -393,6 +400,8 @@ class ScheduleBatch:
         return out_cache_loc
 
     def prepare_for_extend(self, vocab_size: int):
+        self.forward_mode = ForwardMode.EXTEND
+
         bs = self.batch_size()
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -622,6 +631,8 @@ class ScheduleBatch:
         return jump_forward_reqs
 
     def prepare_for_decode(self, input_ids=None):
+        self.forward_mode = ForwardMode.DECODE
+
         if input_ids is None:
             input_ids = [
                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
@@ -640,8 +651,6 @@ class ScheduleBatch:
         self.req_to_token_pool.req_to_token[
             self.req_pool_indices, self.seq_lens - 1
         ] = self.out_cache_loc
-
-        self.sampling_info.update_regex_vocab_mask(self)
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:

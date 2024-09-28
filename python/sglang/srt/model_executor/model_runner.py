@@ -18,6 +18,7 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import json
 import logging
 import pkgutil
 from functools import lru_cache
@@ -96,6 +97,7 @@ class ModelRunner:
                 "disable_flashinfer_sampling": server_args.disable_flashinfer_sampling,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "enable_mla": server_args.enable_mla,
+                "torchao_config": server_args.torchao_config,
             }
         )
 
@@ -162,6 +164,7 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
+        torch.set_num_threads(1)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
@@ -195,9 +198,9 @@ class ModelRunner:
             monkey_patch_vllm_qvk_linear_loader()
 
         self.dtype = self.vllm_model_config.dtype
-        if self.model_config.model_overide_args is not None:
+        if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
-                self.model_config.model_overide_args
+                self.model_config.model_override_args
             )
 
         self.model = get_model(
@@ -348,13 +351,7 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if self.server_args.disable_flashinfer or self.server_args.enable_mla:
-                logger.warning(
-                    "FP8 KV cache is not supported for Triton kernel now, using auto kv cache dtype"
-                )
-                self.kv_cache_dtype = self.dtype
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
+            self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -529,15 +526,11 @@ class ModelRunner:
         if (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(len(batch.reqs))
-            and not batch.sampling_info.has_bias()
+            and batch.sampling_info.can_run_in_cuda_graph()
         ):
             return self.cuda_graph_runner.replay(batch)
 
-        input_metadata = InputMetadata.from_schedule_batch(
-            self,
-            batch,
-            ForwardMode.DECODE,
-        )
+        input_metadata = InputMetadata.from_schedule_batch(self, batch)
 
         return self.model.forward(
             batch.input_ids, input_metadata.positions, input_metadata
@@ -545,11 +538,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_extend(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(
-            self,
-            batch,
-            forward_mode=ForwardMode.EXTEND,
-        )
+        input_metadata = InputMetadata.from_schedule_batch(self, batch)
         if self.is_generation:
             return self.model.forward(
                 batch.input_ids, input_metadata.positions, input_metadata
@@ -565,11 +554,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(
-            self,
-            batch,
-            forward_mode=ForwardMode.EXTEND,
-        )
+        input_metadata = InputMetadata.from_schedule_batch(self, batch)
         return self.model.forward(
             batch.input_ids,
             input_metadata.positions,
@@ -580,16 +565,18 @@ class ModelRunner:
         )
 
     def forward(
-        self, batch: ScheduleBatch, forward_mode: ForwardMode
+        self, batch: ScheduleBatch
     ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
-        if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
+        assert batch.forward_mode is not None
+
+        if self.is_multimodal_model and batch.forward_mode.is_extend():
             return self.forward_extend_multi_modal(batch)
-        elif forward_mode == ForwardMode.DECODE:
+        elif batch.forward_mode.is_decode():
             return self.forward_decode(batch)
-        elif forward_mode == ForwardMode.EXTEND:
+        elif batch.forward_mode.is_extend():
             return self.forward_extend(batch)
         else:
-            raise ValueError(f"Invaid forward mode: {forward_mode}")
+            raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
 
 
 @lru_cache()
@@ -611,16 +598,6 @@ def import_model_classes():
                 else:
                     assert entry.__name__ not in model_arch_name_to_cls
                     model_arch_name_to_cls[entry.__name__] = entry
-
-            # compat: some models such as chatglm has incorrect class set in config.json
-            # usage: [ tuple("From_Entry_Class_Name": EntryClass), ]
-            if hasattr(module, "EntryClassRemapping") and isinstance(
-                module.EntryClassRemapping, list
-            ):
-                for remap in module.EntryClassRemapping:
-                    if isinstance(remap, tuple) and len(remap) == 2:
-                        assert remap[0] not in model_arch_name_to_cls
-                        model_arch_name_to_cls[remap[0]] = remap[1]
 
     return model_arch_name_to_cls
 

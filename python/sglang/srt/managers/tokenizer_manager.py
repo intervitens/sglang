@@ -18,6 +18,7 @@ limitations under the License.
 import asyncio
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -77,7 +78,6 @@ class TokenizerManager:
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        model_overide_args: dict = None,
     ):
         self.server_args = server_args
 
@@ -86,8 +86,8 @@ class TokenizerManager:
         self.recv_from_detokenizer = context.socket(zmq.PULL)
         self.recv_from_detokenizer.bind(f"tcp://127.0.0.1:{port_args.tokenizer_port}")
 
-        self.send_to_router = context.socket(zmq.PUSH)
-        self.send_to_router.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
+        self.send_to_controller = context.socket(zmq.PUSH)
+        self.send_to_controller.connect(f"tcp://127.0.0.1:{port_args.controller_port}")
 
         # Read model args
         self.model_path = server_args.model_path
@@ -95,7 +95,7 @@ class TokenizerManager:
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=server_args.trust_remote_code,
-            model_overide_args=model_overide_args,
+            model_override_args=json.loads(server_args.json_model_override_args),
         )
         self.is_generation = is_generation_model(
             self.hf_config.architectures, self.server_args.is_embedding
@@ -188,6 +188,7 @@ class TokenizerManager:
                 pixel_values, image_hashes, image_sizes = await self._get_pixel_values(
                     obj.image_data if not_use_index else obj.image_data[index]
                 )
+                modalities = obj.modalities
                 return_logprob = (
                     obj.return_logprob if not_use_index else obj.return_logprob[index]
                 )
@@ -243,6 +244,7 @@ class TokenizerManager:
             pixel_values, image_hashes, image_sizes = await self._get_pixel_values(
                 obj.image_data[0]
             )
+            modalities = obj.modalities
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
@@ -263,6 +265,7 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
+                modalities,
             )
         else:  # is embedding
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -271,7 +274,7 @@ class TokenizerManager:
                 input_ids,
                 sampling_params,
             )
-        self.send_to_router.send_pyobj(tokenized_obj)
+        self.send_to_controller.send_pyobj(tokenized_obj)
 
         # Recv results
         event = asyncio.Event()
@@ -346,6 +349,7 @@ class TokenizerManager:
                     pixel_values, image_hashes, image_sizes = (
                         await self._get_pixel_values(obj.image_data[index])
                     )
+                    modalities = obj.modalities
 
                     tokenized_obj = TokenizedGenerateReqInput(
                         rid,
@@ -359,6 +363,7 @@ class TokenizerManager:
                         obj.logprob_start_len[index],
                         obj.top_logprobs_num[index],
                         obj.stream,
+                        modalities,
                     )
                 else:
                     tokenized_obj = TokenizedEmbeddingReqInput(
@@ -367,7 +372,7 @@ class TokenizerManager:
                         input_ids,
                         sampling_params,
                     )
-                self.send_to_router.send_pyobj(tokenized_obj)
+                self.send_to_controller.send_pyobj(tokenized_obj)
 
                 event = asyncio.Event()
                 state = ReqState([], False, event)
@@ -500,14 +505,14 @@ class TokenizerManager:
 
     def flush_cache(self):
         req = FlushCacheReq()
-        self.send_to_router.send_pyobj(req)
+        self.send_to_controller.send_pyobj(req)
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
         req = AbortReq(rid)
-        self.send_to_router.send_pyobj(req)
+        self.send_to_controller.send_pyobj(req)
 
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
@@ -524,7 +529,7 @@ class TokenizerManager:
                 # wait for the previous generation requests to finish
                 while len(self.rid_to_state) > 0:
                     await asyncio.sleep(0)
-                self.send_to_router.send_pyobj(obj)
+                self.send_to_controller.send_pyobj(obj)
                 self.model_update_result = asyncio.Future()
                 result = await self.model_update_result
                 if result.success:

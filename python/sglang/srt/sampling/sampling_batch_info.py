@@ -34,12 +34,17 @@ class SamplingBatchInfo:
     linear_penalties: torch.Tensor = None
     scaling_penalties: torch.Tensor = None
 
-    def has_bias(self):
+    def __len__(self):
+        return len(self.temperatures)
+
+    def can_run_in_cuda_graph(self):
+        # Vocab bias and min_ps are not supported in CUDA graph
         return (
-            self.logit_bias is not None
-            or self.vocab_mask is not None
-            or self.linear_penalties is not None
-            or self.scaling_penalties is not None
+            self.logit_bias is None
+            and self.vocab_mask is None
+            and self.linear_penalties is None
+            and self.scaling_penalties is None
+            and not self.need_min_p_sampling
         )
 
     @classmethod
@@ -48,35 +53,29 @@ class SamplingBatchInfo:
         ret.temperatures = torch.ones((max_bs, 1), dtype=torch.float, device="cuda")
         ret.top_ps = torch.ones((max_bs,), dtype=torch.float, device="cuda")
         ret.top_ks = torch.ones((max_bs,), dtype=torch.int, device="cuda")
-        ret.min_ps = torch.zeros((max_bs,), dtype=torch.float, device="cuda")
         return ret
 
     def __getitem__(self, key):
         if isinstance(key, slice):
-            # NOTE: We do not use cuda graph when there is bias tensors
-            assert not self.has_bias()
+            # NOTE:This method is only used in CUDA graph
+            assert self.can_run_in_cuda_graph()
             return SamplingBatchInfo(
                 vocab_size=self.vocab_size,
                 temperatures=self.temperatures[key],
                 top_ps=self.top_ps[key],
                 top_ks=self.top_ks[key],
-                min_ps=self.min_ps[key],
-                need_min_p_sampling=self.need_min_p_sampling,
             )
         else:
             raise NotImplementedError
 
     def inplace_assign(self, bs: int, other: SamplingBatchInfo):
-        # NOTE: We do not use cuda graph when there is bias tensors
-        assert not self.has_bias()
+        # NOTE:This method is only used in CUDA graph
+        assert self.can_run_in_cuda_graph()
 
         self.vocab_size = other.vocab_size
-        self.need_min_p_sampling = other.need_min_p_sampling
-
         self.temperatures[:bs] = other.temperatures
         self.top_ps[:bs] = other.top_ps
         self.top_ks[:bs] = other.top_ks
-        self.min_ps[:bs] = other.min_ps
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -122,11 +121,9 @@ class SamplingBatchInfo:
         # Handle logit bias but only allocate when needed
         ret.logit_bias = None
 
-        ret.update_regex_vocab_mask(batch)
-
         return ret
 
-    def prepare_penalties(self):
+    def update_penalties(self):
         self.scaling_penalties = None
         self.linear_penalties = None
 
@@ -154,15 +151,15 @@ class SamplingBatchInfo:
         self.vocab_mask = None
 
         if has_regex:
+            self.vocab_mask = torch.zeros(
+                bs, self.vocab_size, dtype=torch.bool, device=device
+            )
             for i, req in enumerate(reqs):
                 if req.regex_fsm is not None:
-                    if self.vocab_mask is None:
-                        self.vocab_mask = torch.zeros(
-                            bs, self.vocab_size, dtype=torch.bool, device=device
-                        )
+                    self.vocab_mask[i].fill_(1)
                     self.vocab_mask[i][
                         req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
-                    ] = 1
+                    ] = 0
 
     def filter(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
@@ -178,6 +175,26 @@ class SamplingBatchInfo:
             if self_val is not None:  # logit_bias can be None
                 setattr(self, item, self_val[new_indices])
 
+    @staticmethod
+    def merge_bias_tensor(
+        lhs: torch.Tensor, rhs: torch.Tensor, bs1: int, bs2: int, default: int = 0
+    ):
+        # bias tensor can be None
+        if lhs is not None or rhs is not None:
+            shape, dtype = None, None
+            if lhs is not None:
+                shape, dtype = lhs.shape[1:], lhs.dtype
+            else:
+                shape, dtype = rhs.shape[1:], rhs.dtype
+            with torch.dtype(dtype):
+                if lhs is None:
+                    lhs = torch.empty((bs1, *shape), device="cuda").fill_(default)
+                if rhs is None:
+                    rhs = torch.empty((bs2, *shape), device="cuda").fill_(default)
+            return torch.cat([lhs, rhs])
+
+        return None
+
     def merge(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
@@ -191,19 +208,6 @@ class SamplingBatchInfo:
             other_val = getattr(other, item, None)
             setattr(self, item, torch.concat([self_val, other_val]))
 
-        # logit_bias can be None
-        if self.logit_bias is not None or other.logit_bias is not None:
-            vocab_size = (
-                self.logit_bias.shape[1]
-                if self.logit_bias is not None
-                else other.logit_bias.shape[1]
-            )
-            if self.logit_bias is None:
-                self.logit_bias = torch.zeros(
-                    (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
-                )
-            if other.logit_bias is None:
-                other.logit_bias = torch.zeros(
-                    (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
-                )
-            self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
+        self.logit_bias = SamplingBatchInfo.merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other)
+        )
