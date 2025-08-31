@@ -71,6 +71,10 @@ from sglang.srt.managers.io_struct import (
     BatchMultimodalOut,
     BatchStrOut,
     BatchTokenIDOut,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
@@ -78,6 +82,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    FreezeGCReq,
     GenerateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -122,7 +127,9 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    configure_gc_warning,
     dataclass_to_string_truncated,
+    freeze_gc,
     get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
@@ -352,6 +359,10 @@ class TokenizerManager:
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
+        # Configure GC warning
+        if self.server_args.gc_warning_threshold_secs > 0.0:
+            configure_gc_warning(self.server_args.gc_warning_threshold_secs)
+
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
@@ -375,6 +386,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.flush_cache_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.profile_communicator = _Communicator(
@@ -439,6 +453,10 @@ class TokenizerManager:
                     self.slow_down_communicator.handle_recv,
                 ),
                 (
+                    ClearHiCacheReqOutput,
+                    self.clear_hicache_storage_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -446,6 +464,10 @@ class TokenizerManager:
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
+                (
+                    FreezeGCReq,
+                    lambda x: None,
+                ),  # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (
                     GetInternalStateReqOutput,
                     self.get_internal_state_communicator.handle_recv,
@@ -757,6 +779,30 @@ class TokenizerManager:
         self.rid_to_state[obj.rid] = state
         return state
 
+    def _send_batch_request(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        tokenized_objs: List[
+            Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+        ],
+        created_time: Optional[float] = None,
+    ):
+        """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+            batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+        else:
+            batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+
+        self.send_to_scheduler.send_pyobj(batch_req)
+
+        # Create states for each individual request in the batch
+        for i, tokenized_obj in enumerate(tokenized_objs):
+            tmp_obj = obj[i]
+            state = ReqState(
+                [], False, asyncio.Event(), tmp_obj, created_time=created_time
+            )
+            self.rid_to_state[tmp_obj.rid] = state
+
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -859,10 +905,17 @@ class TokenizerManager:
 
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
 
-                for i, tokenized_obj in enumerate(tokenized_objs):
+                # Send as a single batched request
+                self._send_batch_request(obj, tokenized_objs, created_time)
+
+                # Set up generators for each request in the batch
+                for i in range(batch_size):
                     tmp_obj = obj[i]
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    generators.append(
+                        self._wait_one_response(
+                            tmp_obj, self.rid_to_state[tmp_obj.rid], request
+                        )
+                    )
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
@@ -943,6 +996,13 @@ class TokenizerManager:
 
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def clear_hicache_storage(self) -> ClearHiCacheReqOutput:
+        """Clear the hierarchical cache storage."""
+        # Delegate to the scheduler to handle HiCacheStorage clearing
+        return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
+            0
+        ]
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -1358,6 +1418,12 @@ class TokenizerManager:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
+
+    async def freeze_gc(self):
+        """Send a freeze_gc message to the scheduler first, then freeze locally."""
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        freeze_gc("Tokenizer Manager")
+        return None
 
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
