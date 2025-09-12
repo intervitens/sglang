@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG VER_SGLANG=cpu_optim
+ARG VER_SGLANG=hybrid
 ARG VER_TORCH=2.7.1
 ARG VER_TORCHVISION=0.22.1
 ARG VER_TRITON=3.3.1
@@ -37,6 +37,7 @@ RUN git clone https://github.com/intervitens/sglang.git && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     pip install -e "python[all_cpu]" && \
+    pip install sentencepiece && \
     pip install torch==${VER_TORCH} torchvision==${VER_TORCHVISION} triton==${VER_TRITON} --force-reinstall && \
     cd sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
