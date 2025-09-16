@@ -56,6 +56,8 @@ if(DEFINED ENV{CONDA_PREFIX})
     endif()
 endif()
 
+find_library(NUMA_LIB numa)
+
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})

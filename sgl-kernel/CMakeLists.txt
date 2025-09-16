@@ -140,6 +140,35 @@ include_directories(
     ${repo-mscclpp_SOURCE_DIR}/include
 )
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(PLAT_LIB_DIR "/usr/lib/aarch64-linux-gnu")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
+    set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
+else()
+    set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
+endif()
+link_directories(${PLAT_LIB_DIR})
+
+find_library(NUMA_LIB numa)
+
+if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
+    set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
+endif()
+
+if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_CPU_FP8_CVT_FTZ")
+    add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
+endif()
+
+add_compile_options(
+    -O3
+    -Wno-unknown-pragmas
+    -march=native
+    -fopenmp
+)
+
 set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
@@ -314,6 +343,24 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
+    "csrc/cpu/activation.cpp"
+    "csrc/cpu/bmm.cpp"
+    "csrc/cpu/decode.cpp"
+    "csrc/cpu/extend.cpp"
+    "csrc/cpu/gemm.cpp"
+    "csrc/cpu/gemm_fp8.cpp"
+    "csrc/cpu/gemm_int8.cpp"
+    "csrc/cpu/interface.cpp"
+    "csrc/cpu/moe.cpp"
+    "csrc/cpu/moe_fp8.cpp"
+    "csrc/cpu/moe_int8.cpp"
+    "csrc/cpu/norm.cpp"
+    "csrc/cpu/numa_utils.cpp"
+    "csrc/cpu/qkv_proj.cpp"
+    "csrc/cpu/rope.cpp"
+    "csrc/cpu/shm.cpp"
+    "csrc/cpu/topk.cpp"
+
     "csrc/memory/store.cu"
     "csrc/kvcacheio/transfer.cu"
 
@@ -365,7 +412,7 @@ add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static ${NUMA_LIB})
 
 # flash attention
 target_compile_definitions(common_ops PRIVATE
