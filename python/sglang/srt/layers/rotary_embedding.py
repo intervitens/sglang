@@ -2896,7 +2896,7 @@ def get_rope_wrapper(
     partial_rotary_factor: float = 1.0,
     device: Optional[str] = None,
 ):
-    if device != "cpu":
+    if device != "cpu" or rope_scaling is None:
         wrapper = aiter_get_rope if _use_aiter else get_rope
         return wrapper(
             head_size,
