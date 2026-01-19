@@ -649,16 +649,28 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
   CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, correction_bias.scalar_type(), "biased_grouped_topk_kernel", [&] {
-    TORCH_CHECK(topk == 8, "Unexpected topk: ", topk);
-    switch (num_experts) {
-      case 256:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
-        break;
-      case 384:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
-        break;
+    switch (topk) {
+      case 8: 
+        switch (num_experts) {
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
+            break;
+          case 384:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
+      case 4:
+        switch (num_experts) {
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(64, 4);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
       default:
-        TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        TORCH_CHECK(false, "Unexpected topk: ", topk);
     }
   });
   return std::make_tuple(topk_weights, topk_ids);
