@@ -650,6 +650,15 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
 
   CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(st, correction_bias.scalar_type(), "biased_grouped_topk_kernel", [&] {
     switch (topk) {
+      case 4:
+        switch (num_experts) {
+          case 64:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(64, 4);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
+        break;
       case 8: 
         switch (num_experts) {
           case 256:
@@ -661,14 +670,7 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
           default:
             TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
         }
-      case 4:
-        switch (num_experts) {
-          case 64:
-            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(64, 4);
-            break;
-          default:
-            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
-        }
+        break;
       default:
         TORCH_CHECK(false, "Unexpected topk: ", topk);
     }
